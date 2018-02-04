@@ -18,6 +18,7 @@ from xml.dom import minidom
 import ast
 import time
 import os
+import ipaddress
 import string
 import logging
 log_level = str(os.environ.get('LOG_LEVEL')).upper()
@@ -155,6 +156,37 @@ def downloadPrivateKey(bucket_name, bucket_prefix, s3_url, prikey):
       config=Config(s3={'addressing_style': 'virtual'}, signature_version='s3v4'))
     log.info("Downloading private key: %s/%s/%s%s",s3_url, bucket_name, bucket_prefix, prikey)
     s3.download_file(bucket_name,bucket_prefix+prikey, '/tmp/'+prikey)
+
+def getVpnGatewayIdFromVpnConnectionId(vpn_connection_id):
+    client = boto3.client('ec2')
+    response = client.describe_vpn_connections(VpnConnectionIds=[vpn_connection_id])
+    vpn_gateway_id = response['VpnConnections'][0]['VpnGatewayId']
+    return vpn_gateway_id
+
+def getVpcIdFromVpnGatewayId(vpn_gateway_id):
+    client = boto3.client('ec2')
+    response = client.describe_vpn_gateways(VpnGatewayIds=[vpn_gateway_id])
+    vpc_id = response['VpnGateways'][0]['VpcAttachments'][0]['VpcId']
+    return vpc_id
+
+def getVpcSpokeCidrFromVpcId(vpc_id):
+    client = boto3.client('ec2')
+    response = client.describe_vpcs(VpcIds=[vpc_id])
+    vpc_cidr = response['Vpcs'][0]['CidrBlock']
+    return vpc_cidr
+
+def getSubnetIdFromPublicIpAddress(ip_address):
+    client = boto3.client('ec2')
+    response = client.describe_network_interfaces(Filters=[{'Name':'association.public-ip', 'Values':[ip_address]}])
+    subnet_id = response['NetworkInterfaces'][0]['SubnetId']
+    return subnet_id
+
+def getSubnetCidrFromSubnetId(subnet_id):
+    client = boto3.client('ec2')
+    response = client.describe_subnets(SubnetIds=[subnet_id])
+    cidr = response['Subnets'][0]['CidrBlock']
+    return cidr
+
 
 #Logic to create the appropriate Cisco configuration
 def create_cisco_config(bucket_name, bucket_key, s3_url, bgp_asn, ssh):
@@ -304,6 +336,35 @@ def create_cisco_config(bucket_name, bucket_key, s3_url, bgp_asn, ssh):
         config_text.append('  neighbor {} next-hop-self'.format(vpn_gateway_tunnel_inside_address_ip_address))
         config_text.append('exit')
         config_text.append('exit')
+
+        # the following configuration adds internet routing
+        vpn_gateway_id = getVpnGatewayIdFromVpnConnectionId(vpn_connection_id)
+        vpc_id = getVpcIdFromVpnGatewayId(vpn_gateway_id)
+        spoke_cidr = getVpcSpokeCidrFromVpcId(vpc_id)
+        n = ipaddress.IPv4Network(spoke_cidr.decode('utf-8'))
+        spoke_ip = str(n.network_address)
+        spoke_hostmask = str(n.hostmask)
+        csr_subnet_id = getSubnetIdFromPublicIpAddress(customer_gateway_tunnel_outside_address)
+        csr_cidr = getSubnetCidrFromSubnetId(csr_subnet_id)
+        n = ipaddress.IPv4Network(csr_cidr.decode('utf-8'))
+        csr_default_gateway_ip = str(n[1])
+
+        config_text.append('router bgp {}'.format(customer_gateway_bgp_asn))
+        config_text.append('  address-family ipv4 vrf {}'.format(vpn_connection_id))
+        config_text.append('  network 0.0.0.0')
+        config_text.append('exit')
+        config_text.append('exit')
+        config_text.append('ip route vrf {} 0.0.0.0 0.0.0.0 {} global'.format(vpn_connection_id, csr_default_gateway_ip))
+        config_text.append('ip access-list standard {}'.format(vpc_id))
+        config_text.append('  10 permit {} {}'.format(spoke_ip, spoke_hostmask))
+        config_text.append('exit')
+        config_text.append('interface GigabitEthernet1')
+        config_text.append('  ip nat outside')
+        config_text.append('exit')
+        config_text.append('interface Tunnel{}'.format(tunnelId))
+        config_text.append('  ip nat inside')
+        config_text.append('exit')
+        config_text.append('ip nat inside source list {} interface GigabitEthernet1 vrf {} overload'.format(vpc_id, vpn_connection_id))
 
         #Increment tunnel ID for going onto the next tunnel
         tunnelId+=1
